@@ -69,6 +69,7 @@ class Agent:
         self.ucb_c = params.get("ucb_c", 2.0)
         self.count_beta = params.get("count_beta", 0.1)
         self.state_bins = params.get("state_bins", 10)
+        self.grad_alpha = params.get("grad_alpha", 0.1)  # step-size for preference updates (gradient method)
 
         self.loss_fn = nn.MSELoss()
         self.optimizer = None
@@ -110,6 +111,22 @@ class Agent:
             counts[action] += 1
             return torch.tensor(action, dtype=torch.long, device=device)
 
+        elif self.exploration == "gradient":
+            # Gradient bandit / REINFORCE-style approach: maintain action
+            # preferences H(s,a), convert to a policy via softmax, and sample.
+            # The preference update (using the reward baseline) happens in
+            # run() once the reward for this action is observed.
+            key = discretize_state(state, bins=self.state_bins)
+            H = self.preferences[key]
+            exp_H = np.exp(H - np.max(H))  # numerically stable softmax
+            probs = exp_H / exp_H.sum()
+            action = int(np.random.choice(len(probs), p=probs))
+            # cache for the update step in run()
+            self._last_grad_key = key
+            self._last_grad_probs = probs
+            self._last_grad_action = action
+            return torch.tensor(action, dtype=torch.long, device=device)
+
         elif self.exploration == "count_bonus":
             # Near-greedy action selection; the exploration incentive is injected
             # into the *reward signal* instead (see run()), inspired by the
@@ -147,6 +164,9 @@ class Agent:
             self.epsilon = self.epsilon_init
             self.temp = self.temp_init
             self.visit_counts = defaultdict(lambda: np.zeros(num_actions))
+            self.preferences = defaultdict(lambda: np.zeros(num_actions))  # H(s,a) for gradient method
+            self.reward_baseline = 0.0  # running mean reward R_bar_t
+            self.baseline_count = 0
 
             target_dqn = DQN(num_states, num_actions).to(device)
             target_dqn.load_state_dict(policy_dqn.state_dict())
@@ -177,6 +197,21 @@ class Agent:
                 episode_reward += reward  # true env reward, used for comparison
 
                 if is_training:
+                    if self.exploration == "gradient":
+                        # R_bar_t: incremental running mean of rewards seen so far
+                        self.baseline_count += 1
+                        self.reward_baseline += (reward - self.reward_baseline) / self.baseline_count
+
+                        H = self.preferences[self._last_grad_key]
+                        probs = self._last_grad_probs
+                        a_taken = self._last_grad_action
+                        delta = self.grad_alpha * (reward - self.reward_baseline)
+                        # H_{t+1}(A_t) = H_t(A_t) + alpha*(R_t - Rbar_t)*(1 - pi_t(A_t))
+                        # H_{t+1}(a)   = H_t(a)   - alpha*(R_t - Rbar_t)*pi_t(a)   for all a != A_t
+                        H[a_taken] += delta * (1 - probs[a_taken])
+                        others = np.arange(num_actions) != a_taken
+                        H[others] -= delta * probs[others]
+
                     stored_reward = reward
                     if self.exploration == "count_bonus":
                         key = discretize_state(state, bins=self.state_bins)
@@ -311,8 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--train", help="Training mode", action="store_true")
     parser.add_argument("--compare", help="Train and compare multiple exploration strategies", action="store_true")
     parser.add_argument("--strategies", nargs="+",
-                         default=["flappybird_eps_greedy", "flappybird_fixed_eps",
-                                  "flappybird_boltzmann", "flappybird_ucb", "flappybird_count_bonus"],
+                         default=["flappybird_gradient", "flappybird_ucb"],
                          help="Parameter set names to compare (used with --compare)")
     parser.add_argument("--episodes", type=int, default=200,
                          help="Episodes per strategy when using --compare")
