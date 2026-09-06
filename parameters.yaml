@@ -1,0 +1,72 @@
+# All strategies below share the SAME core hyperparameters (alpha, gamma, replay size,
+# batch size, sync rate) so that reward/convergence differences come from the
+# exploration strategy alone, not from an unfair hyperparameter mismatch.
+# Only the `exploration` field (and its strategy-specific knobs) differ.
+
+flappybird_eps_greedy:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: epsilon_greedy
+
+flappybird_fixed_eps:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0        # unused by fixed_epsilon, kept for schema consistency
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: fixed_epsilon
+  epsilon_fixed: 0.1
+
+flappybird_boltzmann:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: boltzmann
+  temp_init: 1.0
+  temp_min: 0.05
+  temp_decay: 0.995
+
+flappybird_ucb:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: ucb
+  ucb_c: 2.0
+  state_bins: 10
+
+flappybird_count_bonus:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: count_bonus
+  count_beta: 0.1
+  state_bins: 10

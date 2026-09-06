@@ -1,0 +1,330 @@
+import argparse
+import itertools
+import os
+import random
+from collections import defaultdict
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import yaml
+
+import flappy_bird_gymnasium  # noqa: F401  (registers the FlappyBird-v0 env)
+from dqn import DQN
+from experience_replay import ReplayMemory
+
+if torch.backends.mps.is_available():
+    device = "mps"
+elif torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = "cpu"
+
+RUNS_DIR = "runs"
+os.makedirs(RUNS_DIR, exist_ok=True)
+
+
+def discretize_state(state_tensor, bins=10, low=-2.0, high=2.0):
+    """Turn a continuous state vector into a hashable, binned tuple.
+
+    Flappy Bird's observation space is continuous, so exact tabular visit
+    counts (as used by UCB-Q-Learning / Delayed Q-Learning style algorithms)
+    aren't directly applicable. This is an approximation: we bin each
+    dimension so we can still keep a visit-count table.
+    """
+    state_np = state_tensor.detach().cpu().numpy()
+    clipped = np.clip(state_np, low, high)
+    bin_idx = np.floor((clipped - low) / (high - low) * bins).astype(int)
+    bin_idx = np.clip(bin_idx, 0, bins - 1)
+    return tuple(bin_idx.tolist())
+
+
+class Agent:
+    def __init__(self, param_set, parameters_file="parameters.yaml"):
+        self.param_set = param_set
+        with open(parameters_file, "r") as f:
+            all_param_set = yaml.safe_load(f)
+            params = all_param_set[param_set]
+
+        # Core DQN hyperparameters (shared across exploration strategies)
+        self.alpha = params["alpha"]
+        self.gamma = params["gamma"]
+        self.epsilon_init = params["epsilon_init"]
+        self.epsilon_min = params["epsilon_min"]
+        self.epsilon_decay = params["epsilon_decay"]
+        self.replay_memory_size = params["replay_memory_size"]
+        self.mini_batch_size = params["mini_batch_size"]
+        self.network_sync_rate = params["network_sync_rate"]
+        self.reward_threshold = params["reward_threshold"]
+
+        # Exploration-strategy selection + strategy-specific knobs
+        self.exploration = params.get("exploration", "epsilon_greedy")
+        self.epsilon_fixed = params.get("epsilon_fixed", 0.1)
+        self.temp_init = params.get("temp_init", 1.0)
+        self.temp_min = params.get("temp_min", 0.05)
+        self.temp_decay = params.get("temp_decay", 0.995)
+        self.ucb_c = params.get("ucb_c", 2.0)
+        self.count_beta = params.get("count_beta", 0.1)
+        self.state_bins = params.get("state_bins", 10)
+
+        self.loss_fn = nn.MSELoss()
+        self.optimizer = None
+
+        self.LOG_FILE = os.path.join(RUNS_DIR, f"{self.param_set}.log")
+        self.MODEL_FILE = os.path.join(RUNS_DIR, f"{self.param_set}.pt")
+        self.RESUME_MODEL_FILE = "flappybirdv0_backup.pt"
+
+    def select_action(self, state, policy_dqn, num_actions):
+        """Pick an action according to this agent's exploration strategy."""
+
+        if self.exploration == "epsilon_greedy":
+            if random.random() < self.epsilon:
+                return torch.tensor(random.randrange(num_actions), dtype=torch.long, device=device)
+            with torch.no_grad():
+                return policy_dqn(state.unsqueeze(dim=0)).squeeze().argmax()
+
+        elif self.exploration == "fixed_epsilon":
+            if random.random() < self.epsilon_fixed:
+                return torch.tensor(random.randrange(num_actions), dtype=torch.long, device=device)
+            with torch.no_grad():
+                return policy_dqn(state.unsqueeze(dim=0)).squeeze().argmax()
+
+        elif self.exploration == "boltzmann":
+            with torch.no_grad():
+                q = policy_dqn(state.unsqueeze(dim=0)).squeeze()
+                probs = torch.softmax(q / max(self.temp, 1e-3), dim=0)
+                action = torch.multinomial(probs, 1).item()
+            return torch.tensor(action, dtype=torch.long, device=device)
+
+        elif self.exploration == "ucb":
+            with torch.no_grad():
+                q = policy_dqn(state.unsqueeze(dim=0)).squeeze().cpu().numpy()
+            key = discretize_state(state, bins=self.state_bins)
+            counts = self.visit_counts[key]
+            total = counts.sum() + 1.0
+            bonus = self.ucb_c * np.sqrt(np.log(total + 1.0) / (counts + 1.0))
+            action = int(np.argmax(q + bonus))
+            counts[action] += 1
+            return torch.tensor(action, dtype=torch.long, device=device)
+
+        elif self.exploration == "count_bonus":
+            # Near-greedy action selection; the exploration incentive is injected
+            # into the *reward signal* instead (see run()), inspired by the
+            # optimism-under-uncertainty idea behind Delayed/UCB Q-Learning.
+            if random.random() < 0.05:
+                action = random.randrange(num_actions)
+            else:
+                with torch.no_grad():
+                    action = policy_dqn(state.unsqueeze(dim=0)).squeeze().argmax().item()
+            return torch.tensor(action, dtype=torch.long, device=device)
+
+        else:
+            raise ValueError(f"Unknown exploration strategy: {self.exploration}")
+
+    def run(self, is_training=True, render=False, max_episodes=None, seed=None):
+        """Train or evaluate. If max_episodes is given, stops after that many
+        episodes and returns the per-episode TRUE environment reward history
+        (i.e. never includes any exploration bonus), so strategies are
+        compared on the same footing.
+        """
+        env = gym.make("FlappyBird-v0", render_mode="human" if render else None)
+        num_states = env.observation_space.shape[0]
+        num_actions = env.action_space.n
+        policy_dqn = DQN(num_states, num_actions).to(device)
+
+        reward_history = []
+
+        if is_training:
+            memory = ReplayMemory(self.replay_memory_size)
+
+            if os.path.exists(self.RESUME_MODEL_FILE):
+                policy_dqn.load_state_dict(torch.load(self.RESUME_MODEL_FILE, map_location=device))
+                print(f"[{self.param_set}] Loaded {self.RESUME_MODEL_FILE}")
+
+            self.epsilon = self.epsilon_init
+            self.temp = self.temp_init
+            self.visit_counts = defaultdict(lambda: np.zeros(num_actions))
+
+            target_dqn = DQN(num_states, num_actions).to(device)
+            target_dqn.load_state_dict(policy_dqn.state_dict())
+            steps = 0
+            self.optimizer = optim.Adam(policy_dqn.parameters(), lr=self.alpha)
+            best_reward = float("-inf")
+        else:
+            policy_dqn.load_state_dict(torch.load(self.MODEL_FILE, map_location=device))
+            policy_dqn.eval()
+
+        episode_iter = range(max_episodes) if max_episodes is not None else itertools.count()
+
+        for episode in episode_iter:
+            state, _ = env.reset(seed=seed)
+            state = torch.tensor(state, dtype=torch.float, device=device)
+            episode_reward = 0.0
+            terminated = False
+
+            while not terminated and episode_reward < self.reward_threshold:
+                if is_training:
+                    action = self.select_action(state, policy_dqn, num_actions)
+                else:
+                    with torch.no_grad():
+                        action = policy_dqn(state.unsqueeze(dim=0)).squeeze().argmax()
+
+                next_state, reward, terminated, _, _ = env.step(action.item())
+                next_state = torch.tensor(next_state, dtype=torch.float, device=device)
+                episode_reward += reward  # true env reward, used for comparison
+
+                if is_training:
+                    stored_reward = reward
+                    if self.exploration == "count_bonus":
+                        key = discretize_state(state, bins=self.state_bins)
+                        counts = self.visit_counts[key]
+                        bonus = self.count_beta / np.sqrt(counts[action.item()] + 1.0)
+                        counts[action.item()] += 1
+                        stored_reward = reward + bonus  # shaped reward for training only
+
+                    stored_reward_t = torch.tensor(stored_reward, dtype=torch.float, device=device)
+                    memory.append((state, action, next_state, stored_reward_t, terminated))
+                    steps += 1
+
+                state = next_state
+
+            reward_history.append(episode_reward)
+
+            if is_training:
+                print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f} "
+                      f"epsilon={getattr(self, 'epsilon', None)} temp={getattr(self, 'temp', None)}")
+            else:
+                print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f}")
+
+            if is_training:
+                if self.exploration == "epsilon_greedy":
+                    self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
+                elif self.exploration == "boltzmann":
+                    self.temp = max(self.temp * self.temp_decay, self.temp_min)
+
+                if episode_reward > best_reward:
+                    log_msg = f"best reward={episode_reward} for episode={episode + 1}"
+                    with open(self.LOG_FILE, "a") as f:
+                        f.write(log_msg + "\n")
+                    torch.save(policy_dqn.state_dict(), self.MODEL_FILE)
+                    best_reward = episode_reward
+
+            if is_training and len(memory) > self.mini_batch_size:
+                mini_batch = memory.sample(self.mini_batch_size)
+                self.optimize(mini_batch, policy_dqn, target_dqn)
+                if steps >= self.network_sync_rate:
+                    target_dqn.load_state_dict(policy_dqn.state_dict())
+                    steps = 0
+
+        env.close()
+        return reward_history
+
+    def optimize(self, mini_batch, policy_dqn, target_dqn):
+        states, actions, next_states, rewards, terminations = zip(*mini_batch)
+
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        next_states = torch.stack(next_states)
+        rewards = torch.stack(rewards)
+        terminations = torch.tensor(terminations).float().to(device)
+
+        with torch.no_grad():
+            target_q = rewards + (1 - terminations) * self.gamma * target_dqn(next_states).max(dim=1)[0]
+
+        current_q = policy_dqn(states).gather(dim=1, index=actions.unsqueeze(dim=1)).squeeze()
+
+        loss = self.loss_fn(current_q, target_q)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+
+def compare_exploration_strategies(param_sets, num_episodes=200, seed=None, plot=True):
+    """Train one Agent per exploration strategy from scratch, for the same
+    number of episodes, and compare their reward curves / convergence speed.
+    """
+    results = {}
+    for pset in param_sets:
+        print(f"\n=== Training strategy: {pset} ===")
+        agent = Agent(param_set=pset)
+        history = agent.run(is_training=True, render=False, max_episodes=num_episodes, seed=seed)
+        results[pset] = history
+
+    _save_rewards_csv(results)
+    if plot:
+        plot_comparison(results, window=min(20, max(1, num_episodes // 10)))
+
+    print("\n=== Summary (rolling-mean reward over the final 20 episodes) ===")
+    for pset, history in results.items():
+        arr = np.array(history)
+        tail = arr[-20:] if len(arr) >= 20 else arr
+        print(f"{pset:24s} final_avg_reward={tail.mean():.2f}  best_reward={arr.max():.2f}")
+
+    return results
+
+
+def _save_rewards_csv(results):
+    csv_path = os.path.join(RUNS_DIR, "comparison_rewards.csv")
+    max_len = max(len(h) for h in results.values())
+    with open(csv_path, "w") as f:
+        f.write("episode," + ",".join(results.keys()) + "\n")
+        for i in range(max_len):
+            row = [str(i + 1)]
+            for pset in results:
+                h = results[pset]
+                row.append(f"{h[i]:.3f}" if i < len(h) else "")
+            f.write(",".join(row) + "\n")
+    print(f"Saved raw per-episode rewards to {csv_path}")
+
+
+def plot_comparison(results, window=20):
+    plt.figure(figsize=(10, 6))
+    for pset, history in results.items():
+        arr = np.array(history)
+        if len(arr) >= window:
+            smoothed = np.convolve(arr, np.ones(window) / window, mode="valid")
+            x = np.arange(window, len(arr) + 1)
+        else:
+            smoothed = arr
+            x = np.arange(1, len(arr) + 1)
+        plt.plot(x, smoothed, label=pset)
+
+    plt.xlabel("Episode")
+    plt.ylabel(f"Reward ({window}-episode rolling mean)")
+    plt.title("Exploration Strategy Comparison (DQN on FlappyBird-v0)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    out_path = os.path.join(RUNS_DIR, "comparison_reward.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved comparison plot to {out_path}")
+    plt.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train/test a FlappyBird DQN, or compare exploration strategies.")
+    parser.add_argument("hyperparameters", nargs="?",
+                         help="Parameter set name in parameters.yaml (required unless --compare)")
+    parser.add_argument("--train", help="Training mode", action="store_true")
+    parser.add_argument("--compare", help="Train and compare multiple exploration strategies", action="store_true")
+    parser.add_argument("--strategies", nargs="+",
+                         default=["flappybird_eps_greedy", "flappybird_fixed_eps",
+                                  "flappybird_boltzmann", "flappybird_ucb", "flappybird_count_bonus"],
+                         help="Parameter set names to compare (used with --compare)")
+    parser.add_argument("--episodes", type=int, default=200,
+                         help="Episodes per strategy when using --compare")
+    args = parser.parse_args()
+
+    if args.compare:
+        compare_exploration_strategies(args.strategies, num_episodes=args.episodes)
+    else:
+        if not args.hyperparameters:
+            parser.error("hyperparameters is required unless --compare is used")
+        dql = Agent(param_set=args.hyperparameters)
+        if args.train:
+            dql.run(is_training=True)
+        else:
+            dql.run(is_training=False, render=True)
