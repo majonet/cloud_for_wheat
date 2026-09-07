@@ -247,13 +247,6 @@ class Agent:
             reward_history.append(episode_reward)
 
             if is_training:
-                if (episode + 1) % self.log_every == 0:
-                    print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f} "
-                          f"epsilon={getattr(self, 'epsilon', None)} temp={getattr(self, 'temp', None)}")
-            else:
-                print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f}")
-
-            if is_training:
                 if self.exploration == "epsilon_greedy":
                     self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
                 elif self.exploration == "boltzmann":
@@ -266,6 +259,23 @@ class Agent:
                     torch.save(policy_dqn.state_dict(), self.MODEL_FILE)
                     best_reward = episode_reward
                     best_episode = episode + 1
+
+                if (episode + 1) % self.log_every == 0:
+                    extra = ""
+                    if self.exploration in ("epsilon_greedy", "fixed_epsilon"):
+                        eps = self.epsilon if self.exploration == "epsilon_greedy" else self.epsilon_fixed
+                        extra = f" epsilon={eps:.4f}"
+                    elif self.exploration == "boltzmann":
+                        extra = f" temp={self.temp:.4f}"
+                    elif self.exploration == "ucb":
+                        extra = f" known_states={len(self.visit_counts)}"
+                    elif self.exploration == "gradient":
+                        extra = f" reward_baseline={self.reward_baseline:.3f}"
+                    best_str = f"{best_reward:.1f}" if best_reward != float("-inf") else "n/a"
+                    print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f}"
+                          f" best_so_far={best_str} (ep {best_episode}){extra}")
+            else:
+                print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f}")
 
             if is_training and len(memory) > self.mini_batch_size:
                 mini_batch = memory.sample(self.mini_batch_size)
