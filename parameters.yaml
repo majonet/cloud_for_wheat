@@ -3,45 +3,45 @@
 # exploration strategy alone, not from an unfair hyperparameter mismatch.
 # Only the `exploration` field (and its strategy-specific knobs) differ.
 
-# flappybird_eps_greedy:
-#   alpha: 0.0001
-#   gamma: 0.99
-#   epsilon_init: 1.0
-#   epsilon_min: 0.05
-#   epsilon_decay: 0.9995
-#   replay_memory_size: 50000
-#   mini_batch_size: 64
-#   network_sync_rate: 1000
-#   reward_threshold: 100000
-#   exploration: epsilon_greedy
+flappybird_eps_greedy:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: epsilon_greedy
 
-# flappybird_fixed_eps:
-#   alpha: 0.0001
-#   gamma: 0.99
-#   epsilon_init: 1.0        # unused by fixed_epsilon, kept for schema consistency
-#   epsilon_min: 0.05
-#   epsilon_decay: 0.9995
-#   replay_memory_size: 50000
-#   mini_batch_size: 64
-#   network_sync_rate: 1000
-#   reward_threshold: 100000
-#   exploration: fixed_epsilon
-#   epsilon_fixed: 0.1
+flappybird_fixed_eps:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0        # unused by fixed_epsilon, kept for schema consistency
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: fixed_epsilon
+  epsilon_fixed: 0.1
 
-# flappybird_boltzmann:
-#   alpha: 0.0001
-#   gamma: 0.99
-#   epsilon_init: 1.0
-#   epsilon_min: 0.05
-#   epsilon_decay: 0.9995
-#   replay_memory_size: 50000
-#   mini_batch_size: 64
-#   network_sync_rate: 1000
-#   reward_threshold: 100000
-#   exploration: boltzmann
-#   temp_init: 1.0
-#   temp_min: 0.05
-#   temp_decay: 0.995
+flappybird_boltzmann:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: boltzmann
+  temp_init: 1.0
+  temp_min: 0.05
+  temp_decay: 0.995
 
 flappybird_ucb:
   alpha: 0.0001
@@ -57,6 +57,25 @@ flappybird_ucb:
   ucb_c: 2.0
   state_bins: 10
 
+# UCB on the 180-reading LiDAR observation, tuned for a long (40k-episode) run.
+flappybird_ucb_lidar:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0        # unused by ucb, kept for schema consistency
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 100000   # bigger buffer: more experience to hold over 40k episodes
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: ucb
+  ucb_c: 2.0
+  use_lidar: true
+  hidden_dim: 512           # bigger network for the 180-dim LiDAR input
+  state_bins: 3              # coarse bins per dimension (180 dims -> keep small)
+  count_hash_buckets: 4096   # hash the binned state into a bounded visit-count table
+  log_every: 50               # print progress every 50 episodes (40k episodes is a lot of logs)
+
 flappybird_gradient:
   alpha: 0.0001
   gamma: 0.99
@@ -71,16 +90,16 @@ flappybird_gradient:
   grad_alpha: 0.1     # step-size (alpha) in the H(s,a) preference update
   state_bins: 10
 
-# flappybird_count_bonus:
-#   alpha: 0.0001
-#   gamma: 0.99
-#   epsilon_init: 1.0
-#   epsilon_min: 0.05
-#   epsilon_decay: 0.9995
-#   replay_memory_size: 50000
-#   mini_batch_size: 64
-#   network_sync_rate: 1000
-#   reward_threshold: 100000
-#   exploration: count_bonus
-#   count_beta: 0.1
-#   state_bins: 10
+flappybird_count_bonus:
+  alpha: 0.0001
+  gamma: 0.99
+  epsilon_init: 1.0
+  epsilon_min: 0.05
+  epsilon_decay: 0.9995
+  replay_memory_size: 50000
+  mini_batch_size: 64
+  network_sync_rate: 1000
+  reward_threshold: 100000
+  exploration: count_bonus
+  count_beta: 0.1
+  state_bins: 10

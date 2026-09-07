@@ -27,19 +27,30 @@ RUNS_DIR = "runs"
 os.makedirs(RUNS_DIR, exist_ok=True)
 
 
-def discretize_state(state_tensor, bins=10, low=-2.0, high=2.0):
-    """Turn a continuous state vector into a hashable, binned tuple.
+def discretize_state(state_tensor, bins=10, low=-2.0, high=2.0, n_buckets=None):
+    """Turn a continuous state vector into a hashable key for visit counting.
 
     Flappy Bird's observation space is continuous, so exact tabular visit
     counts (as used by UCB-Q-Learning / Delayed Q-Learning style algorithms)
-    aren't directly applicable. This is an approximation: we bin each
-    dimension so we can still keep a visit-count table.
+    aren't directly applicable. This bins each dimension so we can still keep
+    a visit-count table.
+
+    With the 12-value "simple" observation this is fine as-is. With the
+    180-reading LiDAR observation, a raw per-dimension bin tuple would have
+    an astronomical number of distinct keys (bins^180) — visit counts would
+    almost never repeat, making the UCB bonus meaningless. Pass n_buckets to
+    hash the binned tuple down into a fixed-size table instead; this trades
+    exactness for tractability (different states can collide into the same
+    bucket), which is the practical fix used here for the LiDAR setting.
     """
     state_np = state_tensor.detach().cpu().numpy()
     clipped = np.clip(state_np, low, high)
     bin_idx = np.floor((clipped - low) / (high - low) * bins).astype(int)
     bin_idx = np.clip(bin_idx, 0, bins - 1)
-    return tuple(bin_idx.tolist())
+    key = tuple(bin_idx.tolist())
+    if n_buckets is not None:
+        return hash(key) % n_buckets
+    return key
 
 
 class Agent:
@@ -69,7 +80,13 @@ class Agent:
         self.ucb_c = params.get("ucb_c", 2.0)
         self.count_beta = params.get("count_beta", 0.1)
         self.state_bins = params.get("state_bins", 10)
+        self.count_hash_buckets = params.get("count_hash_buckets", None)  # bucket count for high-dim (LiDAR) states
         self.grad_alpha = params.get("grad_alpha", 0.1)  # step-size for preference updates (gradient method)
+
+        # Environment / network sizing
+        self.use_lidar = params.get("use_lidar", False)
+        self.hidden_dim = params.get("hidden_dim", 256)
+        self.log_every = params.get("log_every", 1)
 
         self.loss_fn = nn.MSELoss()
         self.optimizer = None
@@ -103,7 +120,7 @@ class Agent:
         elif self.exploration == "ucb":
             with torch.no_grad():
                 q = policy_dqn(state.unsqueeze(dim=0)).squeeze().cpu().numpy()
-            key = discretize_state(state, bins=self.state_bins)
+            key = discretize_state(state, bins=self.state_bins, n_buckets=self.count_hash_buckets)
             counts = self.visit_counts[key]
             total = counts.sum() + 1.0
             bonus = self.ucb_c * np.sqrt(np.log(total + 1.0) / (counts + 1.0))
@@ -116,7 +133,7 @@ class Agent:
             # preferences H(s,a), convert to a policy via softmax, and sample.
             # The preference update (using the reward baseline) happens in
             # run() once the reward for this action is observed.
-            key = discretize_state(state, bins=self.state_bins)
+            key = discretize_state(state, bins=self.state_bins, n_buckets=self.count_hash_buckets)
             H = self.preferences[key]
             exp_H = np.exp(H - np.max(H))  # numerically stable softmax
             probs = exp_H / exp_H.sum()
@@ -147,10 +164,10 @@ class Agent:
         (i.e. never includes any exploration bonus), so strategies are
         compared on the same footing.
         """
-        env = gym.make("FlappyBird-v0", render_mode="human" if render else None)
+        env = gym.make("FlappyBird-v0", render_mode="human" if render else None, use_lidar=self.use_lidar)
         num_states = env.observation_space.shape[0]
         num_actions = env.action_space.n
-        policy_dqn = DQN(num_states, num_actions).to(device)
+        policy_dqn = DQN(num_states, num_actions, hidden_dim=self.hidden_dim).to(device)
 
         reward_history = []
 
@@ -168,11 +185,12 @@ class Agent:
             self.reward_baseline = 0.0  # running mean reward R_bar_t
             self.baseline_count = 0
 
-            target_dqn = DQN(num_states, num_actions).to(device)
+            target_dqn = DQN(num_states, num_actions, hidden_dim=self.hidden_dim).to(device)
             target_dqn.load_state_dict(policy_dqn.state_dict())
             steps = 0
             self.optimizer = optim.Adam(policy_dqn.parameters(), lr=self.alpha)
             best_reward = float("-inf")
+            best_episode = None
         else:
             policy_dqn.load_state_dict(torch.load(self.MODEL_FILE, map_location=device))
             policy_dqn.eval()
@@ -214,7 +232,7 @@ class Agent:
 
                     stored_reward = reward
                     if self.exploration == "count_bonus":
-                        key = discretize_state(state, bins=self.state_bins)
+                        key = discretize_state(state, bins=self.state_bins, n_buckets=self.count_hash_buckets)
                         counts = self.visit_counts[key]
                         bonus = self.count_beta / np.sqrt(counts[action.item()] + 1.0)
                         counts[action.item()] += 1
@@ -229,8 +247,9 @@ class Agent:
             reward_history.append(episode_reward)
 
             if is_training:
-                print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f} "
-                      f"epsilon={getattr(self, 'epsilon', None)} temp={getattr(self, 'temp', None)}")
+                if (episode + 1) % self.log_every == 0:
+                    print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f} "
+                          f"epsilon={getattr(self, 'epsilon', None)} temp={getattr(self, 'temp', None)}")
             else:
                 print(f"[{self.param_set}] episode={episode + 1} reward={episode_reward:.1f}")
 
@@ -246,6 +265,7 @@ class Agent:
                         f.write(log_msg + "\n")
                     torch.save(policy_dqn.state_dict(), self.MODEL_FILE)
                     best_reward = episode_reward
+                    best_episode = episode + 1
 
             if is_training and len(memory) > self.mini_batch_size:
                 mini_batch = memory.sample(self.mini_batch_size)
@@ -255,6 +275,17 @@ class Agent:
                     steps = 0
 
         env.close()
+
+        if is_training:
+            # Expose the best result as attributes so it's easy to inspect
+            # after run() returns, e.g. dql.best_reward, dql.best_episode.
+            self.best_reward = best_reward
+            self.best_episode = best_episode
+            print(f"\n[{self.param_set}] TRAINING DONE — "
+                  f"best_reward={best_reward:.1f} at episode={best_episode} "
+                  f"(out of {len(reward_history)} episodes). "
+                  f"Model saved to {self.MODEL_FILE}")
+
         return reward_history
 
     def optimize(self, mini_batch, policy_dqn, target_dqn):
@@ -348,17 +379,22 @@ if __name__ == "__main__":
     parser.add_argument("--strategies", nargs="+",
                          default=["flappybird_gradient", "flappybird_ucb"],
                          help="Parameter set names to compare (used with --compare)")
-    parser.add_argument("--episodes", type=int, default=200,
-                         help="Episodes per strategy when using --compare")
+    parser.add_argument("--episodes", type=int, default=None,
+                         help="Number of episodes to train (used for --compare, default 200 there; "
+                              "also works for a plain --train run, default unlimited there)")
+    parser.add_argument("--log-every", type=int, default=None,
+                         help="Print progress every N episodes during training (overrides parameters.yaml)")
     args = parser.parse_args()
 
     if args.compare:
-        compare_exploration_strategies(args.strategies, num_episodes=args.episodes)
+        compare_exploration_strategies(args.strategies, num_episodes=args.episodes or 200)
     else:
         if not args.hyperparameters:
             parser.error("hyperparameters is required unless --compare is used")
         dql = Agent(param_set=args.hyperparameters)
+        if args.log_every is not None:
+            dql.log_every = args.log_every
         if args.train:
-            dql.run(is_training=True)
+            dql.run(is_training=True, max_episodes=args.episodes)
         else:
             dql.run(is_training=False, render=True)
